@@ -30,6 +30,12 @@ const DEFAULT_SYSTEM_PROMPT = "You are a helpful, concise assistant.";
 const MODELS = {
   e2b: { alias: "gemma-4-e2b", file: "gemma-4-E2B_q4_0-it.gguf" },
   e4b: { alias: "gemma-4-e4b", file: "gemma-4-E4B_q4_0-it.gguf" },
+  // Q3_K_S, not the official Q4_0 build: at 5.72GB it fully offloads on an
+  // 8GB GPU (-ngl 99), measured ~20-24 tok/s with no accuracy loss on a
+  // 10-question spot check vs Q4_0's ~4.5-6.5 tok/s partial CPU/GPU offload.
+  // ctxSize is capped below the global default — at CTX_SIZE=8192 the KV
+  // cache alone risks not fitting alongside the full-offloaded weights.
+  "12b": { alias: "gemma-4-12b", file: "gemma-4-12B-it-Q3_K_S.gguf", ctxSize: "4096" },
 };
 
 let currentModelKey =
@@ -89,10 +95,11 @@ function armIdleTimer(s) {
 
 function spawnSession(modelKey, systemPrompt, maxTokens) {
   const modelPath = modelPathFor(modelKey);
+  const ctxSize = MODELS[modelKey].ctxSize ?? CTX_SIZE;
   const args = [
     "-m", modelPath,
     "-ngl", String(NGL),
-    "-c", String(CTX_SIZE),
+    "-c", String(ctxSize),
     "-n", String(maxTokens),
     "-cnv",
     "--simple-io", "--no-display-prompt", "--log-disable",
@@ -139,22 +146,34 @@ async function clearHistory(s) {
   s.consumed = before + m.index + m[0].length;
 }
 
+// Only the very first turn after spawn is preceded by the startup banner
+// instead of a plain "> " ready-marker. Can't just search for the first
+// "> " after "available commands:" — the help text itself contains
+// "/read <file>        add a text file", and "<file>" followed by
+// whitespace matches "> " too. The real ready-marker is set apart by a
+// blank line before it; the false one in the help text isn't.
+const BANNER_END_RE = /available commands:[\s\S]*?\n[ \t]*\n[ \t]*> /;
+
 function extractFirstTurnText(raw) {
-  // Only the very first turn after spawn is preceded by the startup
-  // banner instead of a plain "> " ready-marker.
-  const bannerIdx = raw.indexOf("available commands:");
-  const rest = bannerIdx >= 0 ? raw.slice(bannerIdx) : raw;
-  const promptIdx = rest.indexOf("> ");
-  return promptIdx >= 0 ? rest.slice(promptIdx + 2) : rest;
+  const m = raw.match(BANNER_END_RE);
+  return m ? raw.slice(m.index + m[0].length) : raw;
 }
 
 async function askSession({ prompt, systemPrompt, maxTokens, modelKey }) {
   let s = session;
   const reusable = s && !s.dead && s.modelKey === modelKey && s.systemPrompt === systemPrompt && s.maxTokens === maxTokens;
-  if (!reusable) {
+  const freshSpawn = !reusable;
+  if (freshSpawn) {
     killSession();
     s = spawnSession(modelKey, systemPrompt, maxTokens);
   } else {
+    // clearHistory's own CLEAR_RE match already consumes past its trailing
+    // "> " ready-marker, so `s.consumed` lands exactly at the start of the
+    // real response — nothing left to strip here. (Previously this path
+    // re-searched for a leading "> " with an unanchored regex, which could
+    // match an arrow like "->" inside the model's own reasoning and chew
+    // into real content — anchoring is what extractFirstTurnText already
+    // does correctly for the fresh-spawn banner case below.)
     await clearHistory(s);
   }
 
@@ -162,7 +181,7 @@ async function askSession({ prompt, systemPrompt, maxTokens, modelKey }) {
   s.child.stdin.write(`${prompt}\n`);
   const footerMatch = await waitForPattern(s, FOOTER_RE, 180000);
   const rawSlice = s.buffer.slice(before, before + footerMatch.index);
-  const body = (s.turns === 0 ? extractFirstTurnText(rawSlice) : rawSlice.replace(/^[\s\S]*?>\s?/, "")).trim();
+  const body = (freshSpawn ? extractFirstTurnText(rawSlice) : rawSlice).trim();
 
   s.turns += 1;
   s.consumed = before + footerMatch.index + footerMatch[0].length;
@@ -332,14 +351,15 @@ server.registerTool(
 server.registerTool(
   "switch_local_llm_model",
   {
-    title: "Switch local LLM model (E2B / E4B)",
+    title: "Switch local LLM model (E2B / E4B / 12B)",
     description:
       "Selects which Gemma 4 size ask_local_llm uses by default. Since there's no persistent " +
       "server anymore, this is just a pointer change — instant, nothing to stop or start. Only " +
       "takes effect on the next ask_local_llm call.",
     inputSchema: {
-      model: z.enum(["e2b", "e4b"]).describe(
-        "e2b = Gemma 4 E2B (~3.3GB, faster) | e4b = Gemma 4 E4B (~5.1GB, larger/slower, likely better quality)"
+      model: z.enum(["e2b", "e4b", "12b"]).describe(
+        "e2b = Gemma 4 E2B (~3.3GB, fastest) | e4b = Gemma 4 E4B (~5.1GB, slower, better quality) | " +
+        "12b = Gemma 4 12B Q3_K_S (~5.7GB, most accurate, ~20-24 tok/s full GPU offload)"
       ),
     },
   },
