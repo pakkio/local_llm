@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
 
@@ -177,8 +177,15 @@ async function askSession({ prompt, systemPrompt, maxTokens, modelKey }) {
     await clearHistory(s);
   }
 
+  // llama-cli's -cnv mode reads stdin line-by-line and submits on every "\n",
+  // so an embedded newline in the prompt gets split into separate turns
+  // (the CLI sees a blank/partial line as the "message" and the real
+  // content arrives too late as unsolicited follow-up input). Collapse
+  // internal newlines to spaces so the whole prompt reaches the CLI as one
+  // line/turn.
+  const singleLinePrompt = prompt.replace(/\r\n|\r|\n/g, " ");
   const before = s.consumed;
-  s.child.stdin.write(`${prompt}\n`);
+  s.child.stdin.write(`${singleLinePrompt}\n`);
   const footerMatch = await waitForPattern(s, FOOTER_RE, 180000);
   const rawSlice = s.buffer.slice(before, before + footerMatch.index);
   const body = (freshSpawn ? extractFirstTurnText(rawSlice) : rawSlice).trim();
@@ -209,6 +216,27 @@ function runLlamaCli(args) {
 }
 
 process.on("exit", killSession);
+// "exit" only fires on a graceful shutdown of *this* process; if the MCP
+// client kills us outright (SIGKILL, or SIGTERM with no time to run JS)
+// the live llama-cli child is orphaned, keeps the model resident, and
+// leaks GPU memory until something notices and kills it by hand. Handle
+// the signals we can, and additionally sweep for orphans left by a prior
+// incarnation of this server before we ever try to spawn a new one.
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    killSession();
+    process.exit(0);
+  });
+}
+
+function killOrphanedSessions() {
+  try {
+    execFileSync("pkill", ["-9", "-f", CLI_BIN], { stdio: "ignore" });
+  } catch {
+    // pkill exits 1 when no process matched — nothing to clean up
+  }
+}
+killOrphanedSessions();
 
 function checkBinary() {
   return new Promise((resolve) => {
